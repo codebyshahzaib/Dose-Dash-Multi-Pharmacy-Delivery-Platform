@@ -1,0 +1,462 @@
+// =============================================================================
+// DATASOURCE & GENERATOR
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum Role {
+  ADMIN
+  CUSTOMER
+  PHARMACIST
+  PHARMACY_OWNER
+  RIDER
+}
+
+enum PrescriptionStatus {
+  PENDING      // uploaded, not yet assigned
+  ASSIGNED     // a pharmacist is working on it
+  PROPOSED     // pharmacist submitted a proposal
+  COMPLETED    // customer accepted and order placed
+  CANCELLED
+}
+
+enum ProposalStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum OrderStatus {
+  PENDING      // just created after proposal accepted
+  CONFIRMED    // pharmacy confirmed
+  PREPARING
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+}
+
+enum FulfillmentStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+}
+
+// =============================================================================
+// IDENTITY LAYER
+// Handles authentication and role assignment only.
+// Business data lives in role-specific profile tables.
+// =============================================================================
+
+model User {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  phone        String?  // Phone number added at user level
+  role         Role
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  // Role profiles — at most one will be non-null
+  admin         Admin?
+  customer      Customer?
+  pharmacist    Pharmacist?
+  pharmacyOwner PharmacyOwner?
+  rider         Rider?
+
+  @@map("users")
+}
+
+model Admin {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @unique @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("admins")
+}
+
+model Customer {
+  id               Int      @id @default(autoincrement())
+  userId           Int      @unique @map("user_id")
+  // city is critical — used to filter pharmacy stock by location
+  city             String?
+  preferredAddress String?  @map("preferred_address")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  prescriptions Prescription[]
+  orders        Order[]
+
+  @@map("customers")
+}
+
+model Pharmacist {
+  id              Int      @id @default(autoincrement())
+  userId          Int      @unique @map("user_id")
+  licenseNumber   String?  @map("license_number")
+  specialization  String?
+  // experienceYears is useful for customer-facing profile display
+  experienceYears Int?     @map("experience_years")
+  // isAvailable controls whether the pharmacist appears for prescription assignment
+  isAvailable     Boolean  @default(false) @map("is_available")
+  // isPrimary designates the master pharmacist who receives all platform requests
+  isPrimary       Boolean  @default(false) @map("is_primary")
+  createdAt       DateTime @default(now()) @map("created_at")
+   
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  prescriptions Prescription[] // prescriptions assigned to this pharmacist
+  proposals     Proposal[]
+
+  @@map("pharmacists")
+}
+
+model PharmacyOwner {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @unique @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pharmacy Pharmacy?
+
+  @@map("pharmacy_owners")
+}
+
+model Rider {
+  id            Int      @id @default(autoincrement())
+  userId        Int      @unique @map("user_id")
+  vehicleType   String?  @map("vehicle_type")
+  vehicleNumber String?  @map("vehicle_number")
+  city          String?  // riders are assigned within their city
+  isAvailable   Boolean  @default(true) @map("is_available")
+  affiliatedPharmacyId Int? @map("affiliated_pharmacy_id") // rider's affiliated pharmacy
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  affiliatedPharmacy Pharmacy?         @relation("RiderAffiliation", fields: [affiliatedPharmacyId], references: [id], onDelete: SetNull)
+  fulfillments      OrderFulfillment[] // a rider is assigned per fulfillment, not per parent order
+
+  @@index([city])
+  @@index([affiliatedPharmacyId])
+  @@map("riders")
+}
+
+// =============================================================================
+// MEDICINE LAYER
+// Global catalog. Not pharmacy-specific.
+// A medicine represents the concept: name + salt + strength + form + packSize.
+// =============================================================================
+
+model Medicine {
+  id           Int      @id @default(autoincrement())
+  name         String   // Brand name e.g. "Panadol"
+  salt         String   // Active ingredient e.g. "Paracetamol" — key for suggesting alternatives
+  manufacturer String?
+  strength     String?  // e.g. "500mg", "10mg/5ml"
+  form         String?  // e.g. "Tablet", "Syrup", "Injection"
+  packSize     Int?     @map("pack_size") // Numeric pack size for calculation (e.g. 10, 30, 100)
+  category     String?  // e.g. "Antibiotic", "Analgesic"
+  requiresRx   Boolean  @default(false) @map("requires_rx")
+  mrp          Int?     // Standard market price for benchmarking
+  description  String?
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  stock             PharmacyStock[]
+  proposalItems     ProposalItem[]
+  prescriptionItems PrescriptionItem[]
+  fulfillmentItems  OrderFulfillmentItem[]
+
+  @@index([salt]) // critical — alternative lookup is always by salt (active ingredient)
+  @@map("medicines")
+}
+
+// =============================================================================
+// PHARMACY LAYER
+// Pharmacy information + what medicines they carry + at what price.
+// =============================================================================
+
+model Pharmacy {
+  id            Int      @id @default(autoincrement())
+  ownerId       Int      @unique @map("owner_id")
+  name          String
+  licenseNumber String?  @map("license_number")
+  address       String?
+  city          String   // indexed — used in all city-filtered stock queries
+  phone         String?
+  latitude      Decimal? @db.Decimal(9, 6)
+  longitude     Decimal? @db.Decimal(9, 6)
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  owner        PharmacyOwner      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  stock        PharmacyStock[]
+  fulfillments OrderFulfillment[] // each fulfillment belongs to exactly one pharmacy
+  affiliatedRiders Rider[] @relation("RiderAffiliation") // riders affiliated with this pharmacy
+
+  @@index([city]) // critical — every pharmacist query filters by customer city
+  @@map("pharmacies")
+}
+
+// -----------------------------------------------------------------------------
+// PharmacyStock — the heart of the inventory system
+//
+// Answers the question:
+//   "Which medicine is available at which pharmacy, in which city, at what price?"
+//
+// City comes from the Pharmacy join — no duplication needed here.
+// Price here represents the "Pack Price (PKR)" from your medicine attributes.
+// -----------------------------------------------------------------------------
+
+model PharmacyStock {
+  id          Int      @id @default(autoincrement())
+  pharmacyId  Int      @map("pharmacy_id")
+  medicineId  Int      @map("medicine_id")
+  price       Int      // Pack price for this medicine at this pharmacy
+  isAvailable Boolean  @default(true) @map("is_available")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+
+  pharmacy     Pharmacy              @relation(fields: [pharmacyId], references: [id], onDelete: Cascade)
+  medicine     Medicine              @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+  alternatives ProposalAlternative[] // pharmacist picks from this when building proposals
+
+  @@unique([pharmacyId, medicineId])
+  @@index([pharmacyId])
+  @@index([medicineId])
+  @@map("pharmacy_stock")
+}
+
+// =============================================================================
+// PRESCRIPTION LAYER
+// Customer uploads a prescription. Each medicine line is a PrescriptionItem.
+// =============================================================================
+
+model Prescription {
+  id           Int                @id @default(autoincrement())
+  customerId   Int                @map("customer_id")
+  // pharmacistId is set when a pharmacist is assigned to review this prescription
+  pharmacistId Int?               @map("pharmacist_id")
+  fileUrl      String             @map("file_url") // uploaded image/PDF
+  notes        String?            // customer notes e.g. "urgent", "need by Friday"
+  status       PrescriptionStatus @default(PENDING)
+  createdAt    DateTime           @default(now()) @map("created_at")
+  updatedAt    DateTime           @updatedAt @map("updated_at")
+
+  customer   Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  pharmacist Pharmacist?        @relation(fields: [pharmacistId], references: [id])
+  items      PrescriptionItem[]
+  proposals  Proposal[]
+
+  @@map("prescriptions")
+}
+
+// -----------------------------------------------------------------------------
+// PrescriptionItem — one row per medicine line in the prescription
+//
+// Why this matters: a prescription has multiple medicines. The pharmacist
+// must respond to each one individually in the proposal.
+// medicineId is nullable because the doctor may prescribe a medicine that
+// does not yet exist in the catalog.
+// -----------------------------------------------------------------------------
+
+model PrescriptionItem {
+  id             Int     @id @default(autoincrement())
+  prescriptionId Int     @map("prescription_id")
+  // Link to catalog if found — null if doctor wrote an unknown brand
+  medicineId     Int?    @map("medicine_id")
+  // Raw text from the prescription — always stored for reference
+  rawName        String  @map("raw_name") // exactly what the doctor wrote
+  rawSalt        String? @map("raw_salt") // clinical generic name
+  rawStrength    String? @map("raw_strength")
+  rawForm        String? @map("raw_form")
+  quantity       Int?    // prescribed quantity if written
+  originalPrice  Int?    @map("original_price") // Doctor's prescribed brand price
+  rawPackSize    Int?     @map("raw_pack_size") // Numeric pack size of doctor brand (e.g. 20)
+  remarks        String? // e.g. "take after meals"
+
+  prescription  Prescription   @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  medicine      Medicine?      @relation(fields: [medicineId], references: [id])
+  proposalItems ProposalItem[] // pharmacist maps each prescription item to a proposal item
+
+  @@map("prescription_items")
+}
+
+// =============================================================================
+// PROPOSAL LAYER
+// Pharmacist's response to a prescription.
+// Contains original prescribed medicine + cheaper alternatives from real stock.
+// =============================================================================
+
+model Proposal {
+  id             Int            @id @default(autoincrement())
+  prescriptionId Int            @map("prescription_id")
+  pharmacistId   Int            @map("pharmacist_id")
+  notes          String?        // pharmacist notes to customer
+  // totalPrice is computed at submission time and treated as immutable after that
+  // recalculate as SUM(selectedAlternative.offeredPrice) before saving
+  totalPrice     Int?           @map("total_price")
+  status         ProposalStatus @default(PENDING)
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  prescription Prescription   @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  pharmacist   Pharmacist     @relation(fields: [pharmacistId], references: [id], onDelete: Cascade)
+  items        ProposalItem[]
+  order        Order?         // created only when customer accepts
+
+  @@map("proposals")
+}
+
+// -----------------------------------------------------------------------------
+// ProposalItem — one per prescription item
+//
+// Links back to the PrescriptionItem so we know which doctor line this answers.
+// Also links to the Medicine catalog (the originally prescribed medicine).
+// -----------------------------------------------------------------------------
+
+model ProposalItem {
+  id                 Int     @id @default(autoincrement())
+  proposalId         Int     @map("proposal_id")
+  prescriptionItemId Int     @map("prescription_item_id") // which doctor line this answers
+  // The originally prescribed medicine from catalog (nullable if unknown brand)
+  medicineId         Int?    @map("medicine_id")
+  // Original price of the prescribed medicine (for comparison display to customer)
+  originalPrice      Int     @map("original_price")
+
+  proposal         Proposal              @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  prescriptionItem PrescriptionItem      @relation(fields: [prescriptionItemId], references: [id])
+  medicine         Medicine?             @relation(fields: [medicineId], references: [id])
+  alternatives     ProposalAlternative[]
+
+  @@map("proposal_items")
+}
+
+// -----------------------------------------------------------------------------
+// ProposalAlternative — the cheaper/equivalent alternatives the pharmacist suggests
+//
+// Each alternative links to a real PharmacyStock row.
+// This gives us: which pharmacy, which city, what price — all in one join.
+// isSelected = true means the customer chose this one.
+// Multiple alternatives per ProposalItem are allowed.
+// Only one should have isSelected = true per ProposalItem after customer accepts.
+// -----------------------------------------------------------------------------
+
+model ProposalAlternative {
+  id              Int     @id @default(autoincrement())
+  proposalItemId  Int     @map("proposal_item_id")
+  // Links to real pharmacy stock — gives pharmacy + medicine + city via joins
+  pharmacyStockId Int     @map("pharmacy_stock_id")
+  quantity        Int     @default(1) // Number of units (tablets/doses) suggested
+  offeredPrice    Int     @map("offered_price")
+  // isSelected is set when customer accepts the proposal
+  // (or pharmacist can pre-select the best one as a recommendation)
+  isSelected      Boolean @default(false) @map("is_selected")
+
+  proposalItem  ProposalItem  @relation(fields: [proposalItemId], references: [id], onDelete: Cascade)
+  pharmacyStock PharmacyStock @relation(fields: [pharmacyStockId], references: [id], onDelete: Cascade)
+
+  @@map("proposal_alternatives")
+}
+
+// =============================================================================
+// ORDER LAYER
+// Created when customer accepts a proposal.
+//
+// SPLIT ORDER LOGIC:
+//   Order = parent record (one per accepted proposal, belongs to customer)
+//   OrderFulfillment = one per pharmacy involved
+//   OrderFulfillmentItem = line items per fulfillment
+//
+// If all selected alternatives come from Pharmacy A:
+//   → 1 OrderFulfillment for Pharmacy A
+//
+// If selected alternatives come from Pharmacy A + Pharmacy B:
+//   → 2 OrderFulfillments (one per pharmacy)
+//   → each pharmacy sees only their own fulfillment on their dashboard
+//
+// The helper function that runs on proposal acceptance:
+//   1. Collect all ProposalAlternatives where isSelected = true
+//   2. Group by pharmacyStock.pharmacyId
+//   3. Create one OrderFulfillment per group
+//   4. Create OrderFulfillmentItems from each group's alternatives
+// =============================================================================
+
+model Order {
+  id              Int         @id @default(autoincrement())
+  customerId      Int         @map("customer_id")
+  proposalId      Int         @unique @map("proposal_id") // one order per accepted proposal
+  deliveryAddress String?     @map("delivery_address")
+  // totalAmount = sum of all fulfillment subtotals
+  totalAmount     Int?        @map("total_amount")
+  status          OrderStatus @default(PENDING)
+  createdAt       DateTime    @default(now()) @map("created_at")
+  updatedAt       DateTime    @updatedAt @map("updated_at")
+
+  customer     Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  proposal     Proposal           @relation(fields: [proposalId], references: [id])
+  fulfillments OrderFulfillment[]
+
+  @@map("orders")
+}
+
+// -----------------------------------------------------------------------------
+// OrderFulfillment — one pharmacy's share of the order
+//
+// Has its own status lifecycle independent of the parent Order.
+// Has its own rider assignment.
+// This is what appears on the pharmacy dashboard.
+// -----------------------------------------------------------------------------
+
+model OrderFulfillment {
+  id         Int               @id @default(autoincrement())
+  orderId    Int               @map("order_id")
+  pharmacyId Int               @map("pharmacy_id")
+  riderId    Int?              @map("rider_id") // assigned when dispatching
+  subtotal   Int
+  status     FulfillmentStatus @default(PENDING)
+  createdAt  DateTime          @default(now()) @map("created_at")
+  updatedAt  DateTime          @updatedAt @map("updated_at")
+
+  order    Order                    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  pharmacy Pharmacy                 @relation(fields: [pharmacyId], references: [id])
+  rider    Rider?                   @relation(fields: [riderId], references: [id])
+  items    OrderFulfillmentItem[]
+
+  @@map("order_fulfillments")
+}
+
+// -----------------------------------------------------------------------------
+// OrderFulfillmentItem — the actual medicines in one pharmacy's fulfillment
+//
+// priceAtPurchase locks the price at order time.
+// medicineId references the selected alternative's medicine.
+// -----------------------------------------------------------------------------
+
+model OrderFulfillmentItem {
+  id              Int     @id @default(autoincrement())
+  fulfillmentId   Int     @map("fulfillment_id")
+  medicineId      Int     @map("medicine_id")
+  quantity        Int
+  priceAtPurchase Int     @map("price_at_purchase")
+
+  fulfillment OrderFulfillment @relation(fields: [fulfillmentId], references: [id], onDelete: Cascade)
+  medicine    Medicine         @relation(fields: [medicineId], references: [id])
+
+  @@map("order_fulfillment_items")
+}
